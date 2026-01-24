@@ -1,4 +1,4 @@
-# Jess-Para Sniper Bot (V27 Python API - 多账号版)
+# Para Sniper Bot (V27 Python API - 多账号版)
 
 Paradex 交易所自动狙击交易机器人，支持多账号轮换和零手续费交易。
 
