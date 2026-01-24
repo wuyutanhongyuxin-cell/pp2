@@ -93,6 +93,185 @@ class RateLimitState:
     trades: List[int] = field(default_factory=list)
 
 
+@dataclass
+class AccountInfo:
+    """账号信息"""
+    l2_private_key: str
+    l2_address: str
+    name: str = ""  # 账号名称/标识
+
+
+class AccountManager:
+    """
+    多账号管理器
+    当一个账号达到日限制时自动切换到下一个账号
+    """
+
+    def __init__(self, accounts: List[AccountInfo], environment: str = "prod"):
+        if not accounts:
+            raise ValueError("至少需要配置一个账号")
+
+        self.accounts = accounts
+        self.environment = environment
+        self.current_index = 0
+        self.clients: Dict[int, 'ParadexInteractiveClient'] = {}
+        self.rate_states: Dict[int, RateLimitState] = {}
+        self.daily_limits = 1000  # 每个账号每天最大交易次数
+
+        # 初始化每个账号的限速状态
+        for i in range(len(accounts)):
+            self.rate_states[i] = RateLimitState()
+
+        log.info(f"账号管理器初始化: 共 {len(accounts)} 个账号")
+
+    def get_current_client(self) -> Optional['ParadexInteractiveClient']:
+        """获取当前活跃的客户端"""
+        if self.current_index >= len(self.accounts):
+            return None
+
+        # 懒加载客户端
+        if self.current_index not in self.clients:
+            account = self.accounts[self.current_index]
+            try:
+                client = ParadexInteractiveClient(
+                    l2_private_key=account.l2_private_key,
+                    l2_address=account.l2_address,
+                    environment=self.environment
+                )
+                self.clients[self.current_index] = client
+                log.info(f"已加载账号 #{self.current_index + 1}: {account.name or account.l2_address[:10]}...")
+            except Exception as e:
+                log.error(f"加载账号 #{self.current_index + 1} 失败: {e}")
+                return None
+
+        return self.clients[self.current_index]
+
+    def get_current_rate_state(self) -> RateLimitState:
+        """获取当前账号的限速状态"""
+        return self.rate_states[self.current_index]
+
+    def get_current_account_name(self) -> str:
+        """获取当前账号名称"""
+        if self.current_index >= len(self.accounts):
+            return "无可用账号"
+        account = self.accounts[self.current_index]
+        return account.name or f"账号#{self.current_index + 1}"
+
+    def is_current_account_limited(self) -> bool:
+        """检查当前账号是否达到日限制"""
+        state = self.get_current_rate_state()
+        today = datetime.now().strftime("%Y-%m-%d")
+
+        # 如果是新的一天，重置计数
+        if state.day != today:
+            state.day = today
+            state.trades = []
+            return False
+
+        return len(state.trades) >= self.daily_limits
+
+    def switch_to_next_account(self) -> bool:
+        """
+        切换到下一个可用账号
+        返回: True 如果成功切换, False 如果所有账号都已达到限制
+        """
+        original_index = self.current_index
+        today = datetime.now().strftime("%Y-%m-%d")
+
+        # 尝试找到下一个未达到日限制的账号
+        for _ in range(len(self.accounts)):
+            self.current_index = (self.current_index + 1) % len(self.accounts)
+
+            # 检查是否回到了起始账号
+            if self.current_index == original_index:
+                # 检查所有账号是否都达到限制
+                all_limited = all(
+                    self.rate_states[i].day == today and
+                    len(self.rate_states[i].trades) >= self.daily_limits
+                    for i in range(len(self.accounts))
+                )
+                if all_limited:
+                    log.warning("所有账号都已达到今日交易限制!")
+                    return False
+
+            # 检查新账号是否可用
+            if not self.is_current_account_limited():
+                log.info(f"切换到 {self.get_current_account_name()}")
+                return True
+
+        return False
+
+    def record_trade(self):
+        """记录一次交易"""
+        state = self.get_current_rate_state()
+        state.trades.append(int(time.time() * 1000))
+
+    def get_all_stats(self) -> Dict:
+        """获取所有账号的统计信息"""
+        today = datetime.now().strftime("%Y-%m-%d")
+        stats = {
+            "current_account": self.get_current_account_name(),
+            "current_index": self.current_index + 1,
+            "total_accounts": len(self.accounts),
+            "accounts": []
+        }
+
+        for i, account in enumerate(self.accounts):
+            state = self.rate_states[i]
+            trades_today = len(state.trades) if state.day == today else 0
+            stats["accounts"].append({
+                "name": account.name or f"账号#{i + 1}",
+                "address": account.l2_address[:10] + "...",
+                "trades_today": trades_today,
+                "remaining": max(0, self.daily_limits - trades_today),
+                "is_limited": trades_today >= self.daily_limits
+            })
+
+        return stats
+
+    def all_accounts_exhausted(self) -> bool:
+        """检查是否所有账号都已用完今日额度"""
+        today = datetime.now().strftime("%Y-%m-%d")
+        return all(
+            self.rate_states[i].day == today and
+            len(self.rate_states[i].trades) >= self.daily_limits
+            for i in range(len(self.accounts))
+        )
+
+    def save_state(self, filepath: str = "account_states.json"):
+        """保存所有账号的状态"""
+        data = {
+            "current_index": self.current_index,
+            "rate_states": {
+                str(i): {"day": state.day, "trades": state.trades[-1000:]}
+                for i, state in self.rate_states.items()
+            }
+        }
+        try:
+            with open(filepath, 'w') as f:
+                json.dump(data, f)
+        except Exception as e:
+            log.error(f"保存账号状态失败: {e}")
+
+    def load_state(self, filepath: str = "account_states.json"):
+        """加载账号状态"""
+        try:
+            if os.path.exists(filepath):
+                with open(filepath, 'r') as f:
+                    data = json.load(f)
+                    self.current_index = data.get("current_index", 0)
+                    for i_str, state_data in data.get("rate_states", {}).items():
+                        i = int(i_str)
+                        if i < len(self.accounts):
+                            self.rate_states[i] = RateLimitState(
+                                day=state_data.get("day", ""),
+                                trades=state_data.get("trades", [])
+                            )
+                log.info(f"已加载账号状态，当前账号: {self.get_current_account_name()}")
+        except Exception as e:
+            log.warning(f"加载账号状态失败: {e}")
+
+
 # =============================================================================
 # Paradex API 客户端 (带 Interactive Token)
 # =============================================================================
@@ -457,14 +636,24 @@ class ParadexInteractiveClient:
 class SniperBot:
     """狙击机器人 - 对应原脚本的主循环逻辑"""
 
-    def __init__(self, client: ParadexInteractiveClient, config: TradingConfig):
+    def __init__(
+        self,
+        client: ParadexInteractiveClient,
+        config: TradingConfig,
+        account_manager: Optional[AccountManager] = None
+    ):
         self.client = client
         self.config = config
         self.stats = Stats()
         self.rate_state = RateLimitState()
+        self.account_manager = account_manager
 
         # 加载持久化数据
         self._load_state()
+
+        # 如果有账号管理器，加载其状态
+        if self.account_manager:
+            self.account_manager.load_state()
 
     def _load_state(self):
         """加载持久化状态"""
@@ -513,6 +702,11 @@ class SniperBot:
 
     def _can_trade(self) -> tuple[bool, Optional[str], Dict]:
         """检查是否可以交易（限速检查）"""
+        # 如果使用多账号管理器
+        if self.account_manager:
+            return self._can_trade_multi_account()
+
+        # 单账号模式（原逻辑）
         # 检查日期是否变化
         if self.rate_state.day != self._day_key():
             self.rate_state.day = self._day_key()
@@ -538,10 +732,61 @@ class SniperBot:
 
         return True, None, usage
 
+    def _can_trade_multi_account(self) -> tuple[bool, Optional[str], Dict]:
+        """多账号模式的限速检查"""
+        # 使用当前账号的限速状态
+        self.rate_state = self.account_manager.get_current_rate_state()
+
+        # 检查日期是否变化
+        if self.rate_state.day != self._day_key():
+            self.rate_state.day = self._day_key()
+            self.rate_state.trades = []
+
+        self._prune_trades()
+
+        usage = {
+            "sec": self._count_trades_in_window(1000),
+            "min": self._count_trades_in_window(60000),
+            "hour": self._count_trades_in_window(3600000),
+            "day": len(self.rate_state.trades),
+            "account": self.account_manager.get_current_account_name(),
+        }
+
+        # 检查是否达到日限制，如果是则尝试切换账号
+        if usage["day"] >= self.config.limits_per_day:
+            log.info(f"{usage['account']} 达到日限制 ({usage['day']}/{self.config.limits_per_day})，尝试切换账号...")
+
+            if self.account_manager.switch_to_next_account():
+                # 成功切换，更新客户端和限速状态
+                new_client = self.account_manager.get_current_client()
+                if new_client:
+                    self.client = new_client
+                    self.rate_state = self.account_manager.get_current_rate_state()
+                    usage["account"] = self.account_manager.get_current_account_name()
+                    # 重新检查新账号的限速
+                    return self._can_trade_multi_account()
+            else:
+                # 所有账号都用完了
+                return False, "all_accounts_exhausted", usage
+
+        if usage["hour"] >= self.config.limits_per_hour:
+            return False, "hour", usage
+        if usage["min"] >= self.config.limits_per_minute:
+            return False, "min", usage
+        if usage["sec"] >= self.config.limits_per_second:
+            return False, "sec", usage
+
+        return True, None, usage
+
     def _record_trade(self):
         """记录一次交易"""
         self.rate_state.trades.append(int(time.time() * 1000))
-        self._save_state()
+
+        # 如果使用多账号管理器，也记录到管理器中并保存
+        if self.account_manager:
+            self.account_manager.save_state()
+        else:
+            self._save_state()
 
     async def _open_position(self) -> tuple[bool, str]:
         """
@@ -723,10 +968,22 @@ class SniperBot:
     async def run(self):
         """主运行循环"""
         log.info("=" * 50)
-        log.info("Jess-Para Sniper Bot (V27 Python API)")
+        log.info("Jess-Para Sniper Bot (V27 Python API - 多账号版)")
         log.info(f"市场: {self.config.market}")
         log.info(f"点差阈值: {self.config.spread_threshold_percent}%")
         log.info(f"订单簿最小厚度: ${self.config.min_order_book_size_usd}")
+
+        # 显示多账号信息
+        if self.account_manager:
+            stats = self.account_manager.get_all_stats()
+            log.info(f"多账号模式: 共 {stats['total_accounts']} 个账号")
+            for acc in stats["accounts"]:
+                status = "🔴 已满" if acc["is_limited"] else "🟢 可用"
+                log.info(f"  {acc['name']}: 今日 {acc['trades_today']}/{self.config.limits_per_day} {status}")
+            log.info(f"当前账号: {stats['current_account']}")
+        else:
+            log.info("单账号模式")
+
         log.info("=" * 50)
 
         # 初始认证
@@ -738,6 +995,7 @@ class SniperBot:
         self.config.enabled = True
         cycle_count = 0
         last_status_time = time.time()
+        last_stats_time = time.time()
 
         while True:
             try:
@@ -749,14 +1007,33 @@ class SniperBot:
                 success, msg = await self.run_cycle()
                 cycle_count += 1
 
+                # 检查是否所有账号都用完
+                if "all_accounts_exhausted" in msg:
+                    log.warning("=" * 50)
+                    log.warning("所有账号今日交易额度已用完!")
+                    log.warning("明天将自动重置，或手动添加新账号")
+                    log.warning("=" * 50)
+                    # 等待到明天凌晨
+                    await self._wait_until_tomorrow()
+                    continue
+
                 if success:
                     log.info(f"交易完成: {msg}")
                     await asyncio.sleep(self.config.cycle_every_ms / 1000)
                 else:
                     # 每 10 秒输出一次状态日志
                     if time.time() - last_status_time >= 10:
-                        log.info(f"[监控中] 周期#{cycle_count} | {msg}")
+                        account_info = ""
+                        if self.account_manager:
+                            account_info = f"[{self.account_manager.get_current_account_name()}] "
+                        log.info(f"[监控中] {account_info}周期#{cycle_count} | {msg}")
                         last_status_time = time.time()
+
+                    # 每 5 分钟输出一次多账号统计
+                    if self.account_manager and time.time() - last_stats_time >= 300:
+                        self._log_account_stats()
+                        last_stats_time = time.time()
+
                     await asyncio.sleep(0.2)
 
             except KeyboardInterrupt:
@@ -767,39 +1044,120 @@ class SniperBot:
                 await asyncio.sleep(1)
 
         log.info("机器人已停止")
-        self._save_state()
+        if self.account_manager:
+            self.account_manager.save_state()
+        else:
+            self._save_state()
+
+    def _log_account_stats(self):
+        """输出账号统计信息"""
+        if not self.account_manager:
+            return
+        stats = self.account_manager.get_all_stats()
+        log.info("--- 账号统计 ---")
+        total_trades = 0
+        for acc in stats["accounts"]:
+            total_trades += acc["trades_today"]
+            status = "满" if acc["is_limited"] else "可用"
+            log.info(f"  {acc['name']}: {acc['trades_today']}/{self.config.limits_per_day} [{status}]")
+        log.info(f"  总计: {total_trades} 笔交易")
+
+    async def _wait_until_tomorrow(self):
+        """等待到明天凌晨"""
+        now = datetime.now()
+        tomorrow = (now + timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0)
+        wait_seconds = (tomorrow - now).total_seconds()
+        log.info(f"等待 {wait_seconds/3600:.1f} 小时后重新开始...")
+        await asyncio.sleep(wait_seconds + 60)  # 多等 1 分钟确保日期变化
 
 
 # =============================================================================
 # 主入口
 # =============================================================================
 
+def parse_accounts(accounts_str: str) -> List[AccountInfo]:
+    """
+    解析多账号配置字符串
+    格式: 私钥1,地址1;私钥2,地址2;私钥3,地址3
+    """
+    accounts = []
+    if not accounts_str:
+        return accounts
+
+    pairs = accounts_str.strip().split(";")
+    for i, pair in enumerate(pairs):
+        pair = pair.strip()
+        if not pair:
+            continue
+
+        parts = pair.split(",")
+        if len(parts) != 2:
+            log.warning(f"跳过无效的账号配置 #{i+1}: {pair[:20]}...")
+            continue
+
+        private_key = parts[0].strip()
+        address = parts[1].strip()
+
+        if not private_key.startswith("0x") or not address.startswith("0x"):
+            log.warning(f"跳过无效的账号配置 #{i+1}: 私钥或地址格式错误")
+            continue
+
+        accounts.append(AccountInfo(
+            l2_private_key=private_key,
+            l2_address=address,
+            name=f"账号#{i+1}"
+        ))
+
+    return accounts
+
+
 async def main():
     # 加载环境变量
     load_dotenv()
 
-    l2_private_key = os.getenv("PARADEX_L2_PRIVATE_KEY")
-    l2_address = os.getenv("PARADEX_L2_ADDRESS")
     environment = os.getenv("PARADEX_ENVIRONMENT", "prod")
     market = os.getenv("MARKET", "BTC-USD-PERP")
 
-    if not l2_private_key or not l2_address:
-        log.error("请在 .env 文件中配置 PARADEX_L2_PRIVATE_KEY 和 PARADEX_L2_ADDRESS")
-        log.error("参考 .env.example 文件")
-        sys.exit(1)
+    # 尝试加载多账号配置
+    accounts_str = os.getenv("PARADEX_ACCOUNTS", "")
+    accounts = parse_accounts(accounts_str)
 
-    # 创建客户端
-    client = ParadexInteractiveClient(
-        l2_private_key=l2_private_key,
-        l2_address=l2_address,
-        environment=environment
-    )
+    account_manager = None
+    client = None
+
+    if accounts:
+        # 多账号模式
+        log.info(f"检测到多账号配置: {len(accounts)} 个账号")
+        account_manager = AccountManager(accounts, environment)
+        client = account_manager.get_current_client()
+
+        if not client:
+            log.error("无法初始化任何账号!")
+            sys.exit(1)
+    else:
+        # 单账号模式（向后兼容）
+        l2_private_key = os.getenv("PARADEX_L2_PRIVATE_KEY")
+        l2_address = os.getenv("PARADEX_L2_ADDRESS")
+
+        if not l2_private_key or not l2_address:
+            log.error("请在 .env 文件中配置账号信息:")
+            log.error("  方式1 (多账号): PARADEX_ACCOUNTS=私钥1,地址1;私钥2,地址2")
+            log.error("  方式2 (单账号): PARADEX_L2_PRIVATE_KEY 和 PARADEX_L2_ADDRESS")
+            log.error("参考 .env.example 文件")
+            sys.exit(1)
+
+        log.info("使用单账号模式")
+        client = ParadexInteractiveClient(
+            l2_private_key=l2_private_key,
+            l2_address=l2_address,
+            environment=environment
+        )
 
     # 创建配置
     config = TradingConfig(market=market)
 
     # 创建并运行机器人
-    bot = SniperBot(client, config)
+    bot = SniperBot(client, config, account_manager)
     await bot.run()
 
 
