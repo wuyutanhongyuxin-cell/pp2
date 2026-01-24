@@ -1,0 +1,24 @@
+# 环境变量（包含私钥，绝对不要提交！）
+.env
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+venv/
+env/
+.venv/
+
+# 运行状态文件
+sniper_state.json
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# 日志
+*.log
