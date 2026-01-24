@@ -53,9 +53,10 @@ class TradingConfig:
     wait_after_close_ms: int = 6000
 
     # 仓位参数
-    open_size_percent: int = 90
+    open_size_percent: int = 90           # 按余额百分比开仓 (当 fixed_size 为空时使用)
     close_size_percent: int = 100
     price_offset: float = 0
+    fixed_size: str = ""                  # 固定交易大小, 如 "0.0009" (优先级高于 open_size_percent)
 
     # 限速
     limits_per_second: int = 3
@@ -815,10 +816,16 @@ class SniperBot:
             if not balance or balance < min_notional:
                 return False, f"余额不足: {balance}"
 
-            # 计算开仓大小（使用余额的 90%）
             mid_price = (bbo["bid"] + bbo["ask"]) / 2
-            trade_value = balance * (self.config.open_size_percent / 100)
-            size = Decimal(str(trade_value / mid_price))
+
+            # 计算开仓大小
+            if self.config.fixed_size:
+                # 使用固定大小
+                size = Decimal(self.config.fixed_size)
+            else:
+                # 按余额百分比计算
+                trade_value = balance * (self.config.open_size_percent / 100)
+                size = Decimal(str(trade_value / mid_price))
 
             # 对齐到 size_increment
             size = (size / size_increment).quantize(Decimal('1'), rounding=ROUND_DOWN) * size_increment
@@ -1155,6 +1162,17 @@ async def main():
 
     # 创建配置
     config = TradingConfig(market=market)
+
+    # 读取交易大小配置
+    fixed_size = os.getenv("FIXED_SIZE", "").strip()
+    if fixed_size:
+        config.fixed_size = fixed_size
+        log.info(f"使用固定交易大小: {fixed_size} BTC")
+    else:
+        open_size_percent = os.getenv("OPEN_SIZE_PERCENT", "")
+        if open_size_percent:
+            config.open_size_percent = int(open_size_percent)
+        log.info(f"使用余额百分比: {config.open_size_percent}%")
 
     # 创建并运行机器人
     bot = SniperBot(client, config, account_manager)
