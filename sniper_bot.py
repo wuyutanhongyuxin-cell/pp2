@@ -173,7 +173,7 @@ class AccountManager:
 
     def switch_to_next_account(self) -> bool:
         """
-        切换到下一个可用账号
+        切换到下一个可用账号 (未达到 day 限制)
         返回: True 如果成功切换, False 如果所有账号都已达到限制
         """
         original_index = self.current_index
@@ -200,6 +200,55 @@ class AccountManager:
                 log.info(f"切换到 {self.get_current_account_name()}")
                 return True
 
+        return False
+
+    def _count_hour_trades(self, account_index: int) -> int:
+        """统计某账号过去1小时的交易数"""
+        state = self.rate_states[account_index]
+        cutoff = int(time.time() * 1000) - 3600000  # 1小时前
+        return len([t for t in state.trades if t > cutoff])
+
+    def is_account_hour_limited(self, account_index: int) -> bool:
+        """检查某账号是否达到小时限制 (300单)"""
+        hour_trades = self._count_hour_trades(account_index)
+        return hour_trades >= 300  # limits_per_hour
+
+    def switch_to_next_available_account(self) -> bool:
+        """
+        切换到下一个小时未满的账号
+        优先找 hour 未满的，如果所有账号 hour 都满了但 day 未满，等待1小时后继续
+        返回: True 如果成功切换, False 如果所有账号 day 都满了
+        """
+        original_index = self.current_index
+        today = datetime.now().strftime("%Y-%m-%d")
+
+        # 尝试找到下一个 hour 未满的账号
+        for _ in range(len(self.accounts)):
+            self.current_index = (self.current_index + 1) % len(self.accounts)
+
+            # 跳过 day 已满的账号
+            state = self.rate_states[self.current_index]
+            if state.day == today and len(state.trades) >= self.daily_limits:
+                continue
+
+            # 检查 hour 是否未满
+            if not self.is_account_hour_limited(self.current_index):
+                log.info(f"切换到 {self.get_current_account_name()} (hour: {self._count_hour_trades(self.current_index)}/300)")
+                return True
+
+        # 所有账号的 hour 都满了，检查是否有 day 未满的
+        for i in range(len(self.accounts)):
+            state = self.rate_states[i]
+            day_trades = len(state.trades) if state.day == today else 0
+            if day_trades < self.daily_limits:
+                # 有账号 day 未满，切换过去等待 hour 重置
+                self.current_index = i
+                hour_trades = self._count_hour_trades(i)
+                log.info(f"切换到 {self.get_current_account_name()} (等待 hour 重置，当前 hour: {hour_trades}/300, day: {day_trades}/1000)")
+                return True
+
+        # 所有账号 day 都满了
+        log.warning("所有账号今日交易额度已用完!")
         return False
 
     def record_trade(self):
@@ -629,6 +678,91 @@ class ParadexInteractiveClient:
             log.error(f"取消订单失败: {e}")
             return False
 
+    async def cancel_all_orders(self, market: str = None) -> int:
+        """取消所有挂单"""
+        try:
+            if not await self.ensure_authenticated():
+                return 0
+
+            import aiohttp
+            async with aiohttp.ClientSession() as session:
+                # 获取所有挂单
+                url = f"{self.base_url}/orders"
+                params = {"status": "OPEN"}
+                if market:
+                    params["market"] = market
+
+                async with session.get(url, headers=self._get_auth_headers(), params=params) as resp:
+                    if resp.status != 200:
+                        return 0
+                    data = await resp.json()
+                    orders = data.get("results", [])
+
+                if not orders:
+                    log.info("没有挂单需要取消")
+                    return 0
+
+                # 取消所有订单
+                cancelled = 0
+                for order in orders:
+                    order_id = order.get("id")
+                    if order_id:
+                        cancel_url = f"{self.base_url}/orders/{order_id}"
+                        async with session.delete(cancel_url, headers=self._get_auth_headers()) as cancel_resp:
+                            if cancel_resp.status in [200, 204]:
+                                cancelled += 1
+
+                log.info(f"已取消 {cancelled}/{len(orders)} 个挂单")
+                return cancelled
+
+        except Exception as e:
+            log.error(f"取消所有订单失败: {e}")
+            return 0
+
+    async def close_all_positions(self, market: str = None) -> int:
+        """平掉所有仓位"""
+        try:
+            if not await self.ensure_authenticated():
+                return 0
+
+            positions = await self.get_positions()
+            if not positions:
+                log.info("没有仓位需要平仓")
+                return 0
+
+            closed = 0
+            for pos in positions:
+                pos_market = pos.get("market")
+                if market and pos_market != market:
+                    continue
+
+                size = pos.get("size", "0")
+                side = pos.get("side", "")
+
+                if float(size) == 0:
+                    continue
+
+                # 平仓方向与持仓相反
+                close_side = "SELL" if side == "LONG" else "BUY"
+
+                result = await self.place_market_order(
+                    market=pos_market,
+                    side=close_side,
+                    size=size,
+                    reduce_only=True
+                )
+
+                if result:
+                    closed += 1
+                    log.info(f"已平仓 {pos_market}: {close_side} {size}")
+
+            log.info(f"已平仓 {closed} 个仓位")
+            return closed
+
+        except Exception as e:
+            log.error(f"平仓所有仓位失败: {e}")
+            return 0
+
 
 # =============================================================================
 # 交易机器人主逻辑
@@ -753,25 +887,21 @@ class SniperBot:
             "account": self.account_manager.get_current_account_name(),
         }
 
-        # 检查是否达到日限制，如果是则尝试切换账号
+        # 检查是否达到日限制 (1000单)，如果所有账号都满了就停止
         if usage["day"] >= self.config.limits_per_day:
-            log.info(f"{usage['account']} 达到日限制 ({usage['day']}/{self.config.limits_per_day})，尝试切换账号...")
+            log.info(f"{usage['account']} 达到日限制 ({usage['day']}/{self.config.limits_per_day})")
 
-            if self.account_manager.switch_to_next_account():
-                # 成功切换，更新客户端和限速状态
-                new_client = self.account_manager.get_current_client()
-                if new_client:
-                    self.client = new_client
-                    self.rate_state = self.account_manager.get_current_rate_state()
-                    usage["account"] = self.account_manager.get_current_account_name()
-                    # 重新检查新账号的限速
-                    return self._can_trade_multi_account()
-            else:
-                # 所有账号都用完了
+            # 检查是否所有账号的 day 限制都满了
+            if self.account_manager.all_accounts_exhausted():
                 return False, "all_accounts_exhausted", usage
 
+            # 标记需要切换账号 (hour 限制触发切换，day 限制不切换只是等待)
+            return False, "day_limit_wait", usage
+
+        # 检查是否达到小时限制 (300单)，触发账号轮换
         if usage["hour"] >= self.config.limits_per_hour:
-            return False, "hour", usage
+            log.info(f"{usage['account']} 达到小时限制 ({usage['hour']}/{self.config.limits_per_hour})，需要切换账号...")
+            return False, "hour_switch", usage
         if usage["min"] >= self.config.limits_per_minute:
             return False, "min", usage
         if usage["sec"] >= self.config.limits_per_second:
@@ -1024,6 +1154,17 @@ class SniperBot:
                     await self._wait_until_tomorrow()
                     continue
 
+                # 检查是否需要因 hour 限制切换账号
+                if "hour_switch" in msg and self.account_manager:
+                    await self._switch_account_with_cleanup()
+                    continue
+
+                # 检查是否达到 day 限制但还有其他账号可用
+                if "day_limit_wait" in msg and self.account_manager:
+                    # 当前账号 day 满了，尝试切换到 hour 未满的账号
+                    await self._switch_account_with_cleanup()
+                    continue
+
                 if success:
                     log.info(f"交易完成: {msg}")
                     await asyncio.sleep(self.config.cycle_every_ms / 1000)
@@ -1076,6 +1217,47 @@ class SniperBot:
         wait_seconds = (tomorrow - now).total_seconds()
         log.info(f"等待 {wait_seconds/3600:.1f} 小时后重新开始...")
         await asyncio.sleep(wait_seconds + 60)  # 多等 1 分钟确保日期变化
+
+    async def _switch_account_with_cleanup(self):
+        """切换账号前执行清仓操作"""
+        if not self.account_manager:
+            return
+
+        current_account = self.account_manager.get_current_account_name()
+        log.info("=" * 50)
+        log.info(f"[{current_account}] 开始切换账号流程...")
+
+        # 1. 取消所有挂单
+        log.info(f"[{current_account}] 取消所有挂单...")
+        await self.client.cancel_all_orders(self.config.market)
+
+        # 2. 平掉所有仓位
+        log.info(f"[{current_account}] 平掉所有仓位...")
+        await self.client.close_all_positions(self.config.market)
+
+        # 3. 保存当前账号状态
+        self.account_manager.save_state()
+
+        # 4. 切换到下一个可用账号
+        if self.account_manager.switch_to_next_available_account():
+            new_client = self.account_manager.get_current_client()
+            if new_client:
+                self.client = new_client
+                self.rate_state = self.account_manager.get_current_rate_state()
+
+                new_account = self.account_manager.get_current_account_name()
+                log.info(f"已切换到 {new_account}")
+
+                # 重新认证新账号
+                if await self.client.authenticate_interactive():
+                    log.info(f"[{new_account}] 认证成功")
+                else:
+                    log.error(f"[{new_account}] 认证失败!")
+
+                log.info("=" * 50)
+        else:
+            log.warning("没有可用的账号可以切换!")
+            log.info("=" * 50)
 
 
 # =============================================================================
