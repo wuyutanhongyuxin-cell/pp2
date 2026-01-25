@@ -213,13 +213,14 @@ class AccountManager:
         hour_trades = self._count_hour_trades(account_index)
         return hour_trades >= 300  # limits_per_hour
 
-    def switch_to_next_available_account(self) -> bool:
+    def switch_to_next_available_account(self) -> str:
         """
         切换到下一个小时未满的账号
-        优先找 hour 未满的，如果所有账号 hour 都满了但 day 未满，等待1小时后继续
-        返回: True 如果成功切换, False 如果所有账号 day 都满了
+        返回:
+          - "switched": 成功切换到 hour 未满的账号
+          - "all_hour_limited": 所有账号 hour 都满了，但有 day 未满的，需要等待
+          - "all_day_limited": 所有账号 day 都满了
         """
-        original_index = self.current_index
         today = datetime.now().strftime("%Y-%m-%d")
 
         # 尝试找到下一个 hour 未满的账号
@@ -234,22 +235,25 @@ class AccountManager:
             # 检查 hour 是否未满
             if not self.is_account_hour_limited(self.current_index):
                 log.info(f"切换到 {self.get_current_account_name()} (hour: {self._count_hour_trades(self.current_index)}/300)")
-                return True
+                return "switched"
 
         # 所有账号的 hour 都满了，检查是否有 day 未满的
+        has_day_available = False
         for i in range(len(self.accounts)):
             state = self.rate_states[i]
             day_trades = len(state.trades) if state.day == today else 0
             if day_trades < self.daily_limits:
-                # 有账号 day 未满，切换过去等待 hour 重置
-                self.current_index = i
-                hour_trades = self._count_hour_trades(i)
-                log.info(f"切换到 {self.get_current_account_name()} (等待 hour 重置，当前 hour: {hour_trades}/300, day: {day_trades}/1000)")
-                return True
+                has_day_available = True
+                break
+
+        if has_day_available:
+            # 所有账号 hour 都满了，需要等待
+            log.info("所有账号小时限制已满，等待重置...")
+            return "all_hour_limited"
 
         # 所有账号 day 都满了
         log.warning("所有账号今日交易额度已用完!")
-        return False
+        return "all_day_limited"
 
     def record_trade(self):
         """记录一次交易"""
@@ -1156,13 +1160,31 @@ class SniperBot:
 
                 # 检查是否需要因 hour 限制切换账号
                 if "hour_switch" in msg and self.account_manager:
-                    await self._switch_account_with_cleanup()
+                    switch_result = await self._switch_account_with_cleanup()
+
+                    if switch_result == "wait_hour":
+                        # 所有账号 hour 都满了，等待一段时间
+                        log.info("所有账号小时限制已满，等待 10 分钟后重试...")
+                        await asyncio.sleep(600)  # 等待 10 分钟
+
+                    elif switch_result == "wait_day":
+                        # 所有账号 day 都满了
+                        await self._wait_until_tomorrow()
+
                     continue
 
                 # 检查是否达到 day 限制但还有其他账号可用
                 if "day_limit_wait" in msg and self.account_manager:
                     # 当前账号 day 满了，尝试切换到 hour 未满的账号
-                    await self._switch_account_with_cleanup()
+                    switch_result = await self._switch_account_with_cleanup()
+
+                    if switch_result == "wait_hour":
+                        log.info("所有账号小时限制已满，等待 10 分钟后重试...")
+                        await asyncio.sleep(600)
+
+                    elif switch_result == "wait_day":
+                        await self._wait_until_tomorrow()
+
                     continue
 
                 if success:
@@ -1218,10 +1240,16 @@ class SniperBot:
         log.info(f"等待 {wait_seconds/3600:.1f} 小时后重新开始...")
         await asyncio.sleep(wait_seconds + 60)  # 多等 1 分钟确保日期变化
 
-    async def _switch_account_with_cleanup(self):
-        """切换账号前执行清仓操作"""
+    async def _switch_account_with_cleanup(self) -> str:
+        """
+        切换账号前执行清仓操作
+        返回:
+          - "switched": 成功切换
+          - "wait_hour": 需要等待小时重置
+          - "wait_day": 需要等待到明天
+        """
         if not self.account_manager:
-            return
+            return "switched"
 
         current_account = self.account_manager.get_current_account_name()
         log.info("=" * 50)
@@ -1239,7 +1267,9 @@ class SniperBot:
         self.account_manager.save_state()
 
         # 4. 切换到下一个可用账号
-        if self.account_manager.switch_to_next_available_account():
+        result = self.account_manager.switch_to_next_available_account()
+
+        if result == "switched":
             new_client = self.account_manager.get_current_client()
             if new_client:
                 self.client = new_client
@@ -1254,10 +1284,16 @@ class SniperBot:
                 else:
                     log.error(f"[{new_account}] 认证失败!")
 
-                log.info("=" * 50)
-        else:
-            log.warning("没有可用的账号可以切换!")
             log.info("=" * 50)
+            return "switched"
+
+        elif result == "all_hour_limited":
+            log.info("=" * 50)
+            return "wait_hour"
+
+        else:  # all_day_limited
+            log.info("=" * 50)
+            return "wait_day"
 
 
 # =============================================================================
