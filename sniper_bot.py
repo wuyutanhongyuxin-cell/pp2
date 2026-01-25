@@ -1209,7 +1209,8 @@ class SniperBot:
                     await asyncio.sleep(0.2)
 
             except KeyboardInterrupt:
-                log.info("收到中断信号，正在退出...")
+                log.info("收到中断信号 (Ctrl+C)，正在执行退出清理...")
+                await self._cleanup_on_exit()
                 break
             except Exception as e:
                 log.error(f"循环异常: {e}")
@@ -1233,6 +1234,54 @@ class SniperBot:
             status = "满" if acc["is_limited"] else "可用"
             log.info(f"  {acc['name']}: {acc['trades_today']}/{self.config.limits_per_day} [{status}]")
         log.info(f"  总计: {total_trades} 笔交易")
+
+    async def _cleanup_on_exit(self):
+        """
+        退出时清理: 取消所有挂单并平掉所有仓位
+        """
+        log.info("=" * 50)
+        log.info("开始退出清理流程...")
+
+        if self.account_manager:
+            # 多账号模式: 清理所有已初始化的账号
+            for idx, client in self.account_manager.clients.items():
+                account_name = self.account_manager.accounts[idx].name or f"账号#{idx + 1}"
+                log.info(f"[{account_name}] 检查并清理...")
+
+                try:
+                    # 确保认证有效
+                    if not await client.ensure_authenticated():
+                        log.warning(f"[{account_name}] 认证失败，跳过清理")
+                        continue
+
+                    # 取消所有挂单
+                    log.info(f"[{account_name}] 取消所有挂单...")
+                    cancelled = await client.cancel_all_orders(self.config.market)
+
+                    # 平掉所有仓位
+                    log.info(f"[{account_name}] 平掉所有仓位...")
+                    closed = await client.close_all_positions(self.config.market)
+
+                    log.info(f"[{account_name}] 清理完成: 取消 {cancelled} 个挂单, 平仓 {closed} 个仓位")
+
+                except Exception as e:
+                    log.error(f"[{account_name}] 清理异常: {e}")
+        else:
+            # 单账号模式
+            try:
+                log.info("取消所有挂单...")
+                cancelled = await self.client.cancel_all_orders(self.config.market)
+
+                log.info("平掉所有仓位...")
+                closed = await self.client.close_all_positions(self.config.market)
+
+                log.info(f"清理完成: 取消 {cancelled} 个挂单, 平仓 {closed} 个仓位")
+
+            except Exception as e:
+                log.error(f"清理异常: {e}")
+
+        log.info("退出清理完成")
+        log.info("=" * 50)
 
     async def _wait_until_tomorrow(self):
         """等待到明天凌晨"""
