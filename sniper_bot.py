@@ -790,9 +790,11 @@ class SniperBot:
         # 加载持久化数据
         self._load_state()
 
-        # 如果有账号管理器，加载其状态
+        # 注意: account_manager 的状态应该在 main() 中提前加载
+        # 这样确保 client 与 current_index 同步
+        # 这里只同步 rate_state
         if self.account_manager:
-            self.account_manager.load_state()
+            self.rate_state = self.account_manager.get_current_rate_state()
 
     def _load_state(self):
         """加载持久化状态"""
@@ -1354,6 +1356,19 @@ async def main():
         # 多账号模式
         log.info(f"检测到多账号配置: {len(accounts)} 个账号")
         account_manager = AccountManager(accounts, environment)
+
+        # 重要: 先加载状态，恢复 current_index，然后再获取客户端
+        # 这样确保重启后使用正确的账号
+        account_manager.load_state()
+
+        # 检查当前账号是否已达到 hour 限制，如果是则尝试切换
+        if account_manager.is_account_hour_limited(account_manager.current_index):
+            log.info(f"当前账号 #{account_manager.current_index + 1} 已达小时限制，尝试切换...")
+            result = account_manager.switch_to_next_available_account()
+            if result == "all_day_limited":
+                log.error("所有账号今日额度已用完!")
+                sys.exit(1)
+
         client = account_manager.get_current_client()
 
         if not client:
