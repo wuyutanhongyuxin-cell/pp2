@@ -11,12 +11,16 @@ import json
 import time
 import asyncio
 import logging
+import signal
 from datetime import datetime, timedelta
 from dataclasses import dataclass, field
 from typing import Optional, Dict, Any, List
 from decimal import Decimal, ROUND_DOWN
 
 from dotenv import load_dotenv
+
+# 全局退出标志
+_shutdown_requested = False
 
 # 配置日志
 logging.basicConfig(
@@ -1110,6 +1114,8 @@ class SniperBot:
 
     async def run(self):
         """主运行循环"""
+        global _shutdown_requested
+
         log.info("=" * 50)
         log.info("Jess-Para Sniper Bot (V27 Python API - 多账号版)")
         log.info(f"市场: {self.config.market}")
@@ -1139,8 +1145,9 @@ class SniperBot:
         cycle_count = 0
         last_status_time = time.time()
         last_stats_time = time.time()
+        last_cleanup_time = time.time()  # 上次清理检查时间
 
-        while True:
+        while not _shutdown_requested:
             try:
                 if not self.config.enabled:
                     log.info("机器人已暂停")
@@ -1156,7 +1163,8 @@ class SniperBot:
                     log.warning("所有账号今日交易额度已用完!")
                     log.warning("明天将自动重置，或手动添加新账号")
                     log.warning("=" * 50)
-                    # 等待到明天凌晨
+                    # 清理后等待到明天凌晨
+                    await self._periodic_cleanup()
                     await self._wait_until_tomorrow()
                     continue
 
@@ -1165,12 +1173,14 @@ class SniperBot:
                     switch_result = await self._switch_account_with_cleanup()
 
                     if switch_result == "wait_hour":
-                        # 所有账号 hour 都满了，等待一段时间
-                        log.info("所有账号小时限制已满，等待 10 分钟后重试...")
+                        # 所有账号 hour 都满了，清理后等待
+                        log.info("所有账号小时限制已满，执行清理后等待 10 分钟...")
+                        await self._periodic_cleanup()
                         await asyncio.sleep(600)  # 等待 10 分钟
 
                     elif switch_result == "wait_day":
                         # 所有账号 day 都满了
+                        await self._periodic_cleanup()
                         await self._wait_until_tomorrow()
 
                     continue
@@ -1181,16 +1191,20 @@ class SniperBot:
                     switch_result = await self._switch_account_with_cleanup()
 
                     if switch_result == "wait_hour":
-                        log.info("所有账号小时限制已满，等待 10 分钟后重试...")
+                        log.info("所有账号小时限制已满，执行清理后等待 10 分钟...")
+                        await self._periodic_cleanup()
                         await asyncio.sleep(600)
 
                     elif switch_result == "wait_day":
+                        await self._periodic_cleanup()
                         await self._wait_until_tomorrow()
 
                     continue
 
                 if success:
                     log.info(f"交易完成: {msg}")
+                    # 交易成功，重置清理计时器
+                    last_cleanup_time = time.time()
                     await asyncio.sleep(self.config.cycle_every_ms / 1000)
                 else:
                     # 每 10 秒输出一次状态日志
@@ -1206,15 +1220,25 @@ class SniperBot:
                         self._log_account_stats()
                         last_stats_time = time.time()
 
+                    # 每 5 分钟执行一次定时清理检查 (当没有成功交易时)
+                    if time.time() - last_cleanup_time >= 300:
+                        log.info("[定时检查] 5分钟未成功交易，检查并清理残留挂单和仓位...")
+                        await self._periodic_cleanup()
+                        last_cleanup_time = time.time()
+
                     await asyncio.sleep(0.2)
 
-            except KeyboardInterrupt:
-                log.info("收到中断信号 (Ctrl+C)，正在执行退出清理...")
-                await self._cleanup_on_exit()
+            except asyncio.CancelledError:
+                log.info("任务被取消，正在执行退出清理...")
                 break
             except Exception as e:
                 log.error(f"循环异常: {e}")
                 await asyncio.sleep(1)
+
+        # 退出前执行清理
+        if _shutdown_requested:
+            log.info("收到退出信号，正在执行退出清理...")
+            await self._cleanup_on_exit()
 
         log.info("机器人已停止")
         if self.account_manager:
@@ -1282,6 +1306,35 @@ class SniperBot:
 
         log.info("退出清理完成")
         log.info("=" * 50)
+
+    async def _periodic_cleanup(self):
+        """
+        定时清理: 检查并清理当前账号的残留挂单和仓位
+        在没有成功交易、限速等待等情况下调用
+        """
+        log.info("[定时清理] 检查残留挂单和仓位...")
+
+        try:
+            # 确保认证有效
+            if not await self.client.ensure_authenticated():
+                log.warning("[定时清理] 认证失败，跳过清理")
+                return
+
+            # 取消所有挂单
+            cancelled = await self.client.cancel_all_orders(self.config.market)
+            if cancelled > 0:
+                log.info(f"[定时清理] 已取消 {cancelled} 个残留挂单")
+
+            # 平掉所有仓位
+            closed = await self.client.close_all_positions(self.config.market)
+            if closed > 0:
+                log.info(f"[定时清理] 已平掉 {closed} 个残留仓位")
+
+            if cancelled == 0 and closed == 0:
+                log.info("[定时清理] 无残留挂单或仓位")
+
+        except Exception as e:
+            log.error(f"[定时清理] 清理异常: {e}")
 
     async def _wait_until_tomorrow(self):
         """等待到明天凌晨"""
@@ -1458,8 +1511,24 @@ async def main():
 
     # 创建并运行机器人
     bot = SniperBot(client, config, account_manager)
+
+    # 设置信号处理器 (Ctrl+C)
+    def signal_handler(sig, frame):
+        global _shutdown_requested
+        log.info("\n收到 Ctrl+C 信号，准备退出...")
+        _shutdown_requested = True
+
+    # 注册信号处理器
+    signal.signal(signal.SIGINT, signal_handler)
+    # Windows 不支持 SIGTERM，只在非 Windows 上注册
+    if sys.platform != "win32":
+        signal.signal(signal.SIGTERM, signal_handler)
+
     await bot.run()
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        log.info("程序已退出")
